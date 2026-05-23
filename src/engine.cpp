@@ -1,12 +1,16 @@
 #include "engine.h"
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
+#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
 #include <unistd.h>
+#include <fastgltf/core.hpp>
+#include <fastgltf/tools.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -54,12 +58,13 @@ void Engine::init()
         throw std::runtime_error(std::string("SDL_CreateWindow failed: ") + SDL_GetError());
 
     init_vulkan();
-    init_swapchain();
     init_commands();
     init_sync();
-    init_allocator();
+    init_allocator();       // must come before init_swapchain (depth image uses VMA)
+    init_swapchain();
     init_descriptor_buffer();
     init_shaders();
+    load_mesh();
 }
 
 void Engine::run()
@@ -352,6 +357,34 @@ void Engine::init_swapchain()
         VK_CHECK(vkCreateSemaphore(_device, &sem_ci, nullptr, &_acquire_semaphores[i]));
         VK_CHECK(vkCreateSemaphore(_device, &sem_ci, nullptr, &_present_semaphores[i]));
     }
+
+    // Depth image — D32_SFLOAT, tied to swapchain extent
+    _depth.format = VK_FORMAT_D32_SFLOAT;
+    _depth.extent = _swapchain_extent;
+
+    VkImageCreateInfo depth_img_ci{
+        .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType   = VK_IMAGE_TYPE_2D,
+        .format      = _depth.format,
+        .extent      = {_swapchain_extent.width, _swapchain_extent.height, 1},
+        .mipLevels   = 1,
+        .arrayLayers = 1,
+        .samples     = VK_SAMPLE_COUNT_1_BIT,
+        .tiling      = VK_IMAGE_TILING_OPTIMAL,
+        .usage       = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+    };
+    VmaAllocationCreateInfo depth_vma_ci{ .usage = VMA_MEMORY_USAGE_GPU_ONLY };
+    VK_CHECK(vmaCreateImage(_allocator, &depth_img_ci, &depth_vma_ci,
+        &_depth.image, &_depth.allocation, nullptr));
+
+    VkImageViewCreateInfo depth_view_ci{
+        .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image    = _depth.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format   = _depth.format,
+        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+    };
+    VK_CHECK(vkCreateImageView(_device, &depth_view_ci, nullptr, &_depth.view));
 }
 
 // ─── init_commands ──────────────────────────────────────────────────────────
@@ -395,6 +428,105 @@ void Engine::init_sync()
     }
 }
 
+// ─── load_mesh ──────────────────────────────────────────────────────────────
+
+void Engine::load_mesh()
+{
+    std::filesystem::path path =
+        "third_party/glTF-Sample-Assets/Models/DamagedHelmet/glTF-Binary/DamagedHelmet.glb";
+
+    auto data = fastgltf::GltfDataBuffer::FromPath(path);
+    if (data.error() != fastgltf::Error::None)
+        throw std::runtime_error("fastgltf: failed to open " + path.string());
+
+    fastgltf::Parser parser;
+    auto result = parser.loadGltf(data.get(), path.parent_path(),
+        fastgltf::Options::LoadExternalBuffers);
+    if (result.error() != fastgltf::Error::None)
+        throw std::runtime_error("fastgltf: " +
+            std::string(fastgltf::getErrorMessage(result.error())));
+
+    fastgltf::Asset& asset = result.get();
+
+    auto& primitive = asset.meshes[0].primitives[0];
+
+    // --- positions ---
+    auto* pos_attr = primitive.findAttribute("POSITION");
+    assert(pos_attr != primitive.attributes.end());
+    auto& pos_acc = asset.accessors[pos_attr->accessorIndex];
+
+    std::vector<Vertex> vertices(pos_acc.count);
+    fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(
+        asset, pos_acc, [&](fastgltf::math::fvec3 v, size_t i) {
+            vertices[i].position = {v.x(), v.y(), v.z()};
+        });
+
+    // --- normals ---
+    auto* nrm_attr = primitive.findAttribute("NORMAL");
+    if (nrm_attr != primitive.attributes.end()) {
+        fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(
+            asset, asset.accessors[nrm_attr->accessorIndex],
+            [&](fastgltf::math::fvec3 n, size_t i) {
+                vertices[i].normal = {n.x(), n.y(), n.z()};
+            });
+    }
+
+    // --- UVs ---
+    auto* uv_attr = primitive.findAttribute("TEXCOORD_0");
+    if (uv_attr != primitive.attributes.end()) {
+        fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(
+            asset, asset.accessors[uv_attr->accessorIndex],
+            [&](fastgltf::math::fvec2 uv, size_t i) {
+                vertices[i].uv = {uv.x(), uv.y()};
+            });
+    }
+
+    // --- indices (expand to uint32) ---
+    assert(primitive.indicesAccessor.has_value());
+    auto& idx_acc = asset.accessors[*primitive.indicesAccessor];
+    std::vector<uint32_t> indices(idx_acc.count);
+    fastgltf::copyFromAccessor<uint32_t>(asset, idx_acc, indices.data());
+
+    _mesh.index_count = (uint32_t)indices.size();
+
+    VmaAllocationCreateInfo vma_ci{
+        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+               | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO,
+    };
+
+    // vertex buffer
+    VkDeviceSize vb_size = vertices.size() * sizeof(Vertex);
+    VkBufferCreateInfo vb_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size  = vb_size,
+        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+    };
+    VK_CHECK(vmaCreateBuffer(_allocator, &vb_ci, &vma_ci,
+        &_mesh.vertex_buffer.buffer,
+        &_mesh.vertex_buffer.allocation,
+        &_mesh.vertex_buffer.info));
+    memcpy(_mesh.vertex_buffer.info.pMappedData, vertices.data(), vb_size);
+
+    // index buffer
+    VkDeviceSize ib_size = indices.size() * sizeof(uint32_t);
+    VkBufferCreateInfo ib_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size  = ib_size,
+        .usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+    };
+    VK_CHECK(vmaCreateBuffer(_allocator, &ib_ci, &vma_ci,
+        &_mesh.index_buffer.buffer,
+        &_mesh.index_buffer.allocation,
+        &_mesh.index_buffer.info));
+    memcpy(_mesh.index_buffer.info.pMappedData, indices.data(), ib_size);
+
+    _deletions.push([&] {
+        vmaDestroyBuffer(_allocator, _mesh.vertex_buffer.buffer, _mesh.vertex_buffer.allocation);
+        vmaDestroyBuffer(_allocator, _mesh.index_buffer.buffer, _mesh.index_buffer.allocation);
+    });
+}
+
 // ─── destroy_swapchain / recreate_swapchain ─────────────────────────────────
 
 void Engine::destroy_swapchain()
@@ -412,6 +544,9 @@ void Engine::destroy_swapchain()
     _present_semaphores.clear();
     vkDestroySwapchainKHR(_device, _swapchain, nullptr);
     _swapchain = VK_NULL_HANDLE;
+
+    if (_depth.view)  { vkDestroyImageView(_device, _depth.view, nullptr); _depth.view = VK_NULL_HANDLE; }
+    if (_depth.image) { vmaDestroyImage(_allocator, _depth.image, _depth.allocation); _depth.image = VK_NULL_HANDLE; }
 }
 
 void Engine::recreate_swapchain()
@@ -461,11 +596,18 @@ void Engine::init_descriptor_buffer()
         vkDestroyDescriptorSetLayout(_device, _empty_set_layout, nullptr);
     });
 
-    // Pipeline layout — required for vkCmdSetDescriptorBufferOffsetsEXT
+    // Pipeline layout — required for vkCmdSetDescriptorBufferOffsetsEXT + push constants
+    VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset     = 0,
+        .size       = 2 * sizeof(glm::mat4),
+    };
     VkPipelineLayoutCreateInfo pl_ci{
-        .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-        .setLayoutCount = 1,
-        .pSetLayouts    = &_empty_set_layout,
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount         = 1,
+        .pSetLayouts            = &_empty_set_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &push_range,
     };
     VK_CHECK(vkCreatePipelineLayout(_device, &pl_ci, nullptr, &_pipeline_layout));
     _deletions.push([&] {
@@ -506,30 +648,39 @@ void Engine::init_shaders()
     auto vert_spirv = read_spirv(base / "shaders/triangle.vert.spv");
     auto frag_spirv = read_spirv(base / "shaders/triangle.frag.spv");
 
+    VkPushConstantRange push_range{
+        .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        .offset     = 0,
+        .size       = 2 * sizeof(glm::mat4),
+    };
     VkShaderCreateInfoEXT shader_infos[2] = {
         {
-            .sType          = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
-            .flags          = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT,
-            .stage          = VK_SHADER_STAGE_VERTEX_BIT,
-            .nextStage      = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .codeType       = VK_SHADER_CODE_TYPE_SPIRV_EXT,
-            .codeSize       = vert_spirv.size() * sizeof(uint32_t),
-            .pCode          = vert_spirv.data(),
-            .pName          = "main",
-            .setLayoutCount = 1,
-            .pSetLayouts    = &_empty_set_layout,
+            .sType                  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+            .flags                  = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT,
+            .stage                  = VK_SHADER_STAGE_VERTEX_BIT,
+            .nextStage              = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .codeType               = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+            .codeSize               = vert_spirv.size() * sizeof(uint32_t),
+            .pCode                  = vert_spirv.data(),
+            .pName                  = "main",
+            .setLayoutCount         = 1,
+            .pSetLayouts            = &_empty_set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges    = &push_range,
         },
         {
-            .sType          = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
-            .flags          = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT,
-            .stage          = VK_SHADER_STAGE_FRAGMENT_BIT,
-            .nextStage      = 0,
-            .codeType       = VK_SHADER_CODE_TYPE_SPIRV_EXT,
-            .codeSize       = frag_spirv.size() * sizeof(uint32_t),
-            .pCode          = frag_spirv.data(),
-            .pName          = "main",
-            .setLayoutCount = 1,
-            .pSetLayouts    = &_empty_set_layout,
+            .sType                  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+            .flags                  = VK_SHADER_CREATE_LINK_STAGE_BIT_EXT,
+            .stage                  = VK_SHADER_STAGE_FRAGMENT_BIT,
+            .nextStage              = 0,
+            .codeType               = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+            .codeSize               = frag_spirv.size() * sizeof(uint32_t),
+            .pCode                  = frag_spirv.data(),
+            .pName                  = "main",
+            .setLayoutCount         = 1,
+            .pSetLayouts            = &_empty_set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges    = &push_range,
         },
     };
 
@@ -580,22 +731,35 @@ void Engine::draw()
     };
     vkBeginCommandBuffer(frame.cmd, &begin);
 
-    // Transition: UNDEFINED → COLOR_ATTACHMENT_OPTIMAL
-    VkImageMemoryBarrier2 barrier{
-        .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask     = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
-        .srcAccessMask    = 0,
-        .dstStageMask     = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-        .dstAccessMask    = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .image            = _swapchain_images[image_index],
-        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+    // Transition colour + depth images to their attachment layouts
+    VkImageMemoryBarrier2 barriers[2] = {
+        {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask     = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .srcAccessMask    = 0,
+            .dstStageMask     = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstAccessMask    = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .image            = _swapchain_images[image_index],
+            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        },
+        {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask     = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+            .srcAccessMask    = 0,
+            .dstStageMask     = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+            .dstAccessMask    = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .oldLayout        = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout        = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+            .image            = _depth.image,
+            .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+        },
     };
     VkDependencyInfo dep{
         .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers    = &barrier,
+        .imageMemoryBarrierCount = 2,
+        .pImageMemoryBarriers    = barriers,
     };
     vkCmdPipelineBarrier2(frame.cmd, &dep);
 
@@ -608,12 +772,21 @@ void Engine::draw()
         .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
         .clearValue  = {.color = {0.1f, 0.1f, 0.1f, 1.0f}},
     };
+    VkRenderingAttachmentInfo depth_att{
+        .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView   = _depth.view,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+        .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp     = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+        .clearValue  = {.depthStencil = {1.0f, 0}},
+    };
     VkRenderingInfo rendering{
         .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
         .renderArea           = {{0, 0}, _swapchain_extent},
         .layerCount           = 1,
         .colorAttachmentCount = 1,
         .pColorAttachments    = &color_att,
+        .pDepthAttachment     = &depth_att,
     };
     vkCmdBeginRendering(frame.cmd, &rendering);
 
@@ -661,8 +834,9 @@ void Engine::draw()
     vkCmdSetCullMode(frame.cmd, VK_CULL_MODE_NONE);
     vkCmdSetFrontFace(frame.cmd, VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPolygonModeEXT(frame.cmd, VK_POLYGON_MODE_FILL);
-    vkCmdSetDepthTestEnable(frame.cmd, VK_FALSE);
-    vkCmdSetDepthWriteEnable(frame.cmd, VK_FALSE);
+    vkCmdSetDepthTestEnable(frame.cmd, VK_TRUE);
+    vkCmdSetDepthWriteEnable(frame.cmd, VK_TRUE);
+    vkCmdSetDepthCompareOp(frame.cmd, VK_COMPARE_OP_LESS);
     vkCmdSetStencilTestEnable(frame.cmd, VK_FALSE);
     VkSampleMask sample_mask = 0xFFFFFFFF;
     vkCmdSetRasterizationSamplesEXT(frame.cmd, VK_SAMPLE_COUNT_1_BIT);
@@ -674,19 +848,55 @@ void Engine::draw()
     VkBool32 blend_enable = VK_FALSE;
     vkCmdSetColorBlendEnableEXT(frame.cmd, 0, 1, &blend_enable);
     vkCmdSetColorWriteMaskEXT(frame.cmd, 0, 1, &color_mask);
-    vkCmdSetVertexInputEXT(frame.cmd, 0, nullptr, 0, nullptr);
+    VkVertexInputBindingDescription2EXT vib{
+        .sType     = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+        .binding   = 0,
+        .stride    = sizeof(Vertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+        .divisor   = 1,
+    };
+    VkVertexInputAttributeDescription2EXT via[3] = {
+        {VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, nullptr,
+         0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, position)},
+        {VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, nullptr,
+         1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)},
+        {VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, nullptr,
+         2, 0, VK_FORMAT_R32G32_SFLOAT,    offsetof(Vertex, uv)},
+    };
+    vkCmdSetVertexInputEXT(frame.cmd, 1, &vib, 3, via);
 
-    vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+    // Push constants — rotate mesh around Y axis
+    glm::mat4 model = glm::rotate(glm::mat4(1.f),
+        glm::radians(_frame_number * 0.3f), glm::vec3(0, 1, 0));
+    glm::mat4 view  = glm::lookAt(glm::vec3(0, 0, 3), glm::vec3(0), glm::vec3(0, 1, 0));
+    glm::mat4 proj  = glm::perspective(glm::radians(60.f),
+        (float)_swapchain_extent.width / _swapchain_extent.height, 0.01f, 100.f);
+    proj[1][1] *= -1;  // flip Y for Vulkan NDC
+    struct PC { glm::mat4 mvp; glm::mat4 model; };
+    PC pc{ proj * view * model, model };
+    vkCmdPushConstants(frame.cmd, _pipeline_layout,
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+        0, sizeof(PC), &pc);
+
+    VkDeviceSize vertex_offset = 0;
+    vkCmdBindVertexBuffers(frame.cmd, 0, 1, &_mesh.vertex_buffer.buffer, &vertex_offset);
+    vkCmdBindIndexBuffer(frame.cmd, _mesh.index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(frame.cmd, _mesh.index_count, 1, 0, 0, 0);
     vkCmdEndRendering(frame.cmd);
 
-    // Transition: COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR
-    barrier.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-    barrier.dstStageMask  = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-    barrier.dstAccessMask = 0;
-    barrier.oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    barrier.newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    vkCmdPipelineBarrier2(frame.cmd, &dep);
+    // Transition: COLOR_ATTACHMENT_OPTIMAL → PRESENT_SRC_KHR (color only)
+    barriers[0].srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    barriers[0].srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    barriers[0].dstStageMask  = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+    barriers[0].dstAccessMask = 0;
+    barriers[0].oldLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barriers[0].newLayout     = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    VkDependencyInfo present_dep{
+        .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers    = &barriers[0],
+    };
+    vkCmdPipelineBarrier2(frame.cmd, &present_dep);
 
     vkEndCommandBuffer(frame.cmd);
 

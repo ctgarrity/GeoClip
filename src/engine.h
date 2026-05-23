@@ -35,6 +35,7 @@ private:
     VkExtent2D               _swapchain_extent{};
     std::vector<VkImage>     _swapchain_images;
     std::vector<VkImageView> _swapchain_views;
+    AllocatedImage           _depth{};
 
     std::array<FrameData, FRAMES_IN_FLIGHT> _frames{};
     uint32_t   _frame_number{0};
@@ -47,6 +48,8 @@ private:
     //                      the presentation engine releases that image.
     std::vector<VkSemaphore> _acquire_semaphores;
     std::vector<VkSemaphore> _present_semaphores;
+
+    Mesh _mesh{};
 
     VkShaderEXT           _vert_shader{};
     VkShaderEXT           _frag_shader{};
@@ -63,6 +66,7 @@ private:
     void init_allocator();
     void init_descriptor_buffer();
     void init_shaders();
+    void load_mesh();
 
     void destroy_swapchain();
     void recreate_swapchain();

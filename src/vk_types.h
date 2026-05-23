@@ -38,3 +38,26 @@ struct AllocatedBuffer
     VmaAllocation     allocation{};
     VmaAllocationInfo info{};
 };
+
+struct Vertex
+{
+    glm::vec3 position;
+    glm::vec3 normal;
+    glm::vec2 uv;
+};  // stride = 32 bytes
+
+struct Mesh
+{
+    AllocatedBuffer vertex_buffer{};
+    AllocatedBuffer index_buffer{};
+    uint32_t        index_count{0};
+};
+
+struct AllocatedImage
+{
+    VkImage       image{VK_NULL_HANDLE};
+    VkImageView   view{VK_NULL_HANDLE};
+    VmaAllocation allocation{};
+    VkExtent2D    extent{};
+    VkFormat      format{};
+};

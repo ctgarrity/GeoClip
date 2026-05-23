@@ -1,32 +1,53 @@
+[[vk::push_constant]]
+cbuffer PushConstants
+{
+    float4x4 mvp;
+    float4x4 model;
+};
+
+static const float3 kLightDir   = normalize(float3(1.0, 2.0, 1.5));
+static const float3 kLightColor = float3(1.0, 0.98, 0.92);
+static const float3 kCameraPos  = float3(0.0, 0.0, 3.0);
+static const float  kAmbient    = 0.05;
+static const float  kShininess  = 64.0;
+
+struct VertexInput
+{
+    [[vk::location(0)]] float3 position : POSITION;
+    [[vk::location(1)]] float3 normal   : NORMAL;
+    [[vk::location(2)]] float2 uv       : TEXCOORD0;
+};
+
 struct VertexOutput
 {
-    float4 position : SV_Position;
-    [[vk::location(0)]] float3 color;
-};
-
-static const float2 kPositions[3] = {
-    float2( 0.0, -0.5),
-    float2( 0.5,  0.5),
-    float2(-0.5,  0.5),
-};
-
-static const float3 kColors[3] = {
-    float3(1.0, 0.0, 0.0),
-    float3(0.0, 1.0, 0.0),
-    float3(0.0, 0.0, 1.0),
+    float4 position                      : SV_Position;
+    [[vk::location(0)]] float3 worldPos;
+    [[vk::location(1)]] float3 worldNormal;
+    [[vk::location(2)]] float2 uv;
 };
 
 [shader("vertex")]
-VertexOutput vertexMain(uint vertexIndex : SV_VertexID)
+VertexOutput vertexMain(VertexInput input)
 {
     VertexOutput o;
-    o.position = float4(kPositions[vertexIndex], 0.0, 1.0);
-    o.color    = kColors[vertexIndex];
+    float4 wp     = mul(model, float4(input.position, 1.0));
+    o.worldPos    = wp.xyz;
+    o.position    = mul(mvp, float4(input.position, 1.0));
+    o.worldNormal = normalize(mul((float3x3)model, input.normal));
+    o.uv          = input.uv;
     return o;
 }
 
 [shader("fragment")]
 float4 fragmentMain(VertexOutput input) : SV_Target
 {
-    return float4(input.color, 1.0);
+    float3 N = normalize(input.worldNormal);
+    float3 L = kLightDir;
+    float3 V = normalize(kCameraPos - input.worldPos);
+    float3 H = normalize(L + V);
+
+    float diff   = max(dot(N, L), 0.0);
+    float spec   = pow(max(dot(N, H), 0.0), kShininess);
+    float3 color = kLightColor * (kAmbient + diff + 0.4 * spec);
+    return float4(color, 1.0);
 }
