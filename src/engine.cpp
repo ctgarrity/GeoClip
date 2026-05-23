@@ -71,8 +71,14 @@ void Engine::run()
 {
     bool running = true;
     SDL_Event event;
+    Uint64 perf_freq    = SDL_GetPerformanceFrequency();
+    Uint64 last_counter = SDL_GetPerformanceCounter();
     while (running)
     {
+        Uint64 now = SDL_GetPerformanceCounter();
+        float  dt  = float(now - last_counter) / float(perf_freq);
+        last_counter = now;
+
         while (SDL_PollEvent(&event))
         {
             if (event.type == SDL_EVENT_QUIT)
@@ -80,7 +86,38 @@ void Engine::run()
             if (event.type == SDL_EVENT_WINDOW_RESIZED ||
                 event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED)
                 _swapchain_dirty = true;
+            if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN &&
+                event.button.button == SDL_BUTTON_LEFT) {
+                SDL_SetWindowRelativeMouseMode(_window, true);
+                _mouse_captured = true;
+            }
+            if (event.type == SDL_EVENT_KEY_DOWN &&
+                event.key.key == SDLK_ESCAPE) {
+                SDL_SetWindowRelativeMouseMode(_window, false);
+                _mouse_captured = false;
+            }
+            if (event.type == SDL_EVENT_MOUSE_MOTION && _mouse_captured) {
+                _yaw   += event.motion.xrel * _mouse_sensitivity;
+                _pitch -= event.motion.yrel * _mouse_sensitivity;
+                _pitch  = glm::clamp(_pitch, -89.f, 89.f);
+            }
         }
+
+        if (_mouse_captured) {
+            const bool* keys = SDL_GetKeyboardState(nullptr);
+            float yr = glm::radians(_yaw), pr = glm::radians(_pitch);
+            glm::vec3 forward = glm::normalize(glm::vec3{
+                std::cos(pr) * std::cos(yr),
+                std::sin(pr),
+                std::cos(pr) * std::sin(yr)
+            });
+            glm::vec3 right = glm::normalize(glm::cross(forward, glm::vec3(0, 1, 0)));
+            if (keys[SDL_SCANCODE_W]) _cam_pos += forward * _cam_speed * dt;
+            if (keys[SDL_SCANCODE_S]) _cam_pos -= forward * _cam_speed * dt;
+            if (keys[SDL_SCANCODE_D]) _cam_pos += right   * _cam_speed * dt;
+            if (keys[SDL_SCANCODE_A]) _cam_pos -= right   * _cam_speed * dt;
+        }
+
         if (_swapchain_dirty)
             recreate_swapchain();
         draw();
@@ -201,6 +238,12 @@ void Engine::init_vulkan()
     }
     if (_physical_device == VK_NULL_HANDLE)
         throw std::runtime_error("no suitable GPU with required extensions found");
+    {
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(_physical_device, &props);
+        if (props.limits.maxPushConstantsSize < 144)
+            throw std::runtime_error("GPU push constant limit too small");
+    }
 
     // --- queue family ---
     uint32_t qf_count = 0;
@@ -600,7 +643,7 @@ void Engine::init_descriptor_buffer()
     VkPushConstantRange push_range{
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset     = 0,
-        .size       = 2 * sizeof(glm::mat4),
+        .size       = sizeof(glm::mat4) * 2 + sizeof(glm::vec4),
     };
     VkPipelineLayoutCreateInfo pl_ci{
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -651,7 +694,7 @@ void Engine::init_shaders()
     VkPushConstantRange push_range{
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset     = 0,
-        .size       = 2 * sizeof(glm::mat4),
+        .size       = sizeof(glm::mat4) * 2 + sizeof(glm::vec4),
     };
     VkShaderCreateInfoEXT shader_infos[2] = {
         {
@@ -865,15 +908,19 @@ void Engine::draw()
     };
     vkCmdSetVertexInputEXT(frame.cmd, 1, &vib, 3, via);
 
-    // Push constants — rotate mesh around Y axis
-    glm::mat4 model = glm::rotate(glm::mat4(1.f),
-        glm::radians(_frame_number * 0.3f), glm::vec3(0, 1, 0));
-    glm::mat4 view  = glm::lookAt(glm::vec3(0, 0, 3), glm::vec3(0), glm::vec3(0, 1, 0));
-    glm::mat4 proj  = glm::perspective(glm::radians(60.f),
+    glm::mat4 model = glm::mat4(1.f);
+    float yr = glm::radians(_yaw), pr = glm::radians(_pitch);
+    glm::vec3 forward = glm::normalize(glm::vec3{
+        std::cos(pr) * std::cos(yr),
+        std::sin(pr),
+        std::cos(pr) * std::sin(yr)
+    });
+    glm::mat4 view = glm::lookAt(_cam_pos, _cam_pos + forward, glm::vec3(0, 1, 0));
+    glm::mat4 proj = glm::perspective(glm::radians(60.f),
         (float)_swapchain_extent.width / _swapchain_extent.height, 0.01f, 100.f);
-    proj[1][1] *= -1;  // flip Y for Vulkan NDC
-    struct PC { glm::mat4 mvp; glm::mat4 model; };
-    PC pc{ proj * view * model, model };
+    proj[1][1] *= -1;
+    struct PC { glm::mat4 mvp; glm::mat4 model; glm::vec4 cam_pos; };
+    PC pc{ proj * view * model, model, glm::vec4(_cam_pos, 1.f) };
     vkCmdPushConstants(frame.cmd, _pipeline_layout,
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         0, sizeof(PC), &pc);

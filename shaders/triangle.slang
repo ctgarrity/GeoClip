@@ -3,11 +3,11 @@ cbuffer PushConstants
 {
     float4x4 mvp;
     float4x4 model;
+    float3   cam_pos;
 };
 
 static const float3 kLightDir   = normalize(float3(1.0, 2.0, 1.5));
 static const float3 kLightColor = float3(1.0, 0.98, 0.92);
-static const float3 kCameraPos  = float3(0.0, 0.0, 3.0);
 static const float  kAmbient    = 0.05;
 static const float  kShininess  = 64.0;
 
@@ -43,7 +43,7 @@ float4 fragmentMain(VertexOutput input) : SV_Target
 {
     float3 N = normalize(input.worldNormal);
     float3 L = kLightDir;
-    float3 V = normalize(kCameraPos - input.worldPos);
+    float3 V = normalize(cam_pos - input.worldPos);
     float3 H = normalize(L + V);
 
     float diff   = max(dot(N, L), 0.0);

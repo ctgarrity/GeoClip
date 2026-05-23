@@ -41,6 +41,13 @@ private:
     uint32_t   _frame_number{0};
     FrameData& current_frame() { return _frames[_frame_number % FRAMES_IN_FLIGHT]; }
 
+    glm::vec3 _cam_pos{0.f, 0.f, 3.f};
+    float     _yaw{-90.f};
+    float     _pitch{0.f};
+    bool      _mouse_captured{false};
+    float     _cam_speed{3.f};
+    float     _mouse_sensitivity{0.1f};
+
     VmaAllocator _allocator{};
 
     // _acquire_semaphores: indexed by frame number — prevents reuse before the GPU finishes.
