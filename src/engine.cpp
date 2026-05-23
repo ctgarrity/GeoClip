@@ -908,7 +908,7 @@ void Engine::draw()
     };
     vkCmdSetVertexInputEXT(frame.cmd, 1, &vib, 3, via);
 
-    glm::mat4 model = glm::mat4(1.f);
+    glm::mat4 model = glm::rotate(glm::mat4(1.f), glm::radians(90.f), glm::vec3(1, 0, 0));
     float yr = glm::radians(_yaw), pr = glm::radians(_pitch);
     glm::vec3 forward = glm::normalize(glm::vec3{
         std::cos(pr) * std::cos(yr),
