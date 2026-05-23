@@ -46,7 +46,28 @@ target_include_directories(imgui PUBLIC
 target_compile_definitions(imgui PUBLIC IMGUI_IMPL_VULKAN_USE_VOLK)
 target_link_libraries(imgui PUBLIC SDL3::SDL3 volk)
 
-add_executable(GeoClip src/main.cpp)
+# Slang shader compilation
+# Each .slang file contains both vertex and fragment entry points and is compiled
+# to two separate SPIR-V files: <name>.vert.spv and <name>.frag.spv
+find_program(SLANGC slangc REQUIRED)
+
+function(add_slang_shader TARGET SHADER_NAME)
+    set(src "${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.slang")
+    set(vert_spv "${CMAKE_BINARY_DIR}/shaders/${SHADER_NAME}.vert.spv")
+    set(frag_spv "${CMAKE_BINARY_DIR}/shaders/${SHADER_NAME}.frag.spv")
+    set(slang_flags -target spirv -profile spirv_1_4 -emit-spirv-directly)
+    add_custom_command(
+        OUTPUT  ${vert_spv} ${frag_spv}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${SLANGC} ${src} -entry vertexMain   -stage vertex   ${slang_flags} -o ${vert_spv}
+        COMMAND ${SLANGC} ${src} -entry fragmentMain -stage fragment ${slang_flags} -o ${frag_spv}
+        DEPENDS ${src}
+        VERBATIM
+    )
+    target_sources(${TARGET} PRIVATE ${vert_spv} ${frag_spv})
+endfunction()
+
+add_executable(GeoClip src/main.cpp src/engine.cpp src/vma_impl.cpp)
 target_link_libraries(GeoClip PRIVATE
     SDL3::SDL3
     glm::glm
@@ -55,3 +76,6 @@ target_link_libraries(GeoClip PRIVATE
     fastgltf
     imgui
 )
+target_include_directories(GeoClip PRIVATE src)
+
+add_slang_shader(GeoClip triangle)
