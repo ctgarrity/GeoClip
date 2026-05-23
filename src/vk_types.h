@@ -1,5 +1,14 @@
 #pragma once
+#include <stdexcept>
+#include <string>
 #include <volk.h>
+
+#define VK_CHECK(expr) \
+    do { \
+        VkResult _r = (expr); \
+        if (_r != VK_SUCCESS) \
+            throw std::runtime_error(#expr " failed (VkResult=" + std::to_string(_r) + ")"); \
+    } while (0)
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include <vk_mem_alloc.h>

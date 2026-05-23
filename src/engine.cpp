@@ -1,7 +1,6 @@
 #include "engine.h"
 #include <SDL3/SDL_vulkan.h>
 #include <algorithm>
-#include <cassert>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -47,9 +46,12 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(
 
 void Engine::init()
 {
-    SDL_Init(SDL_INIT_VIDEO);
+    if (!SDL_Init(SDL_INIT_VIDEO))
+        throw std::runtime_error(std::string("SDL_Init failed: ") + SDL_GetError());
     _window = SDL_CreateWindow("GeoClip", 1280, 720,
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+    if (!_window)
+        throw std::runtime_error(std::string("SDL_CreateWindow failed: ") + SDL_GetError());
 
     init_vulkan();
     init_swapchain();
@@ -101,7 +103,9 @@ void Engine::init_vulkan()
     const char* const* sdl_exts = SDL_Vulkan_GetInstanceExtensions(&sdl_ext_count);
 
     std::vector<const char*> instance_exts(sdl_exts, sdl_exts + sdl_ext_count);
+#ifndef NDEBUG
     instance_exts.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+#endif
 
     VkDebugUtilsMessengerCreateInfoEXT debug_ci{
         .sType           = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -113,34 +117,45 @@ void Engine::init_vulkan()
         .pfnUserCallback = debug_callback,
     };
 
-    const char* layers[] = { "VK_LAYER_KHRONOS_validation" };
-
     VkApplicationInfo app_info{
-        .sType      = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+        .sType            = VK_STRUCTURE_TYPE_APPLICATION_INFO,
         .pApplicationName = "GeoClip",
-        .apiVersion = VK_API_VERSION_1_3,
+        .apiVersion       = VK_API_VERSION_1_3,
     };
+
+#ifndef NDEBUG
+    const char* layers[]         = { "VK_LAYER_KHRONOS_validation" };
+    uint32_t    layer_count      = 1;
+    const void* inst_pnext       = &debug_ci;
+#else
+    const char** layers          = nullptr;
+    uint32_t     layer_count     = 0;
+    const void*  inst_pnext      = nullptr;
+#endif
 
     VkInstanceCreateInfo inst_ci{
         .sType                   = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-        .pNext                   = &debug_ci,
+        .pNext                   = inst_pnext,
         .pApplicationInfo        = &app_info,
-        .enabledLayerCount       = 1,
+        .enabledLayerCount       = layer_count,
         .ppEnabledLayerNames     = layers,
         .enabledExtensionCount   = (uint32_t)instance_exts.size(),
         .ppEnabledExtensionNames = instance_exts.data(),
     };
-    vkCreateInstance(&inst_ci, nullptr, &_instance);
+    VK_CHECK(vkCreateInstance(&inst_ci, nullptr, &_instance));
     volkLoadInstance(_instance);
     _deletions.push([&] { vkDestroyInstance(_instance, nullptr); });
 
-    vkCreateDebugUtilsMessengerEXT(_instance, &debug_ci, nullptr, &_debug_messenger);
+#ifndef NDEBUG
+    VK_CHECK(vkCreateDebugUtilsMessengerEXT(_instance, &debug_ci, nullptr, &_debug_messenger));
     _deletions.push([&] {
         vkDestroyDebugUtilsMessengerEXT(_instance, _debug_messenger, nullptr);
     });
+#endif
 
     // --- surface ---
-    SDL_Vulkan_CreateSurface(_window, _instance, nullptr, &_surface);
+    if (!SDL_Vulkan_CreateSurface(_window, _instance, nullptr, &_surface))
+        throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface failed: ") + SDL_GetError());
     _deletions.push([&] { vkDestroySurfaceKHR(_instance, _surface, nullptr); });
 
     // --- physical device ---
@@ -179,7 +194,8 @@ void Engine::init_vulkan()
         _physical_device = pd;
         if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) break;
     }
-    assert(_physical_device != VK_NULL_HANDLE && "no suitable GPU found");
+    if (_physical_device == VK_NULL_HANDLE)
+        throw std::runtime_error("no suitable GPU with required extensions found");
 
     // --- queue family ---
     uint32_t qf_count = 0;
@@ -245,7 +261,7 @@ void Engine::init_vulkan()
         .enabledExtensionCount   = (uint32_t)std::size(required_device_exts),
         .ppEnabledExtensionNames = required_device_exts,
     };
-    vkCreateDevice(_physical_device, &dev_ci, nullptr, &_device);
+    VK_CHECK(vkCreateDevice(_physical_device, &dev_ci, nullptr, &_device));
     volkLoadDevice(_device);
     _deletions.push([&] { vkDestroyDevice(_device, nullptr); });
 
@@ -306,7 +322,7 @@ void Engine::init_swapchain()
         .presentMode      = VK_PRESENT_MODE_FIFO_KHR,
         .clipped          = VK_TRUE,
     };
-    vkCreateSwapchainKHR(_device, &sc_ci, nullptr, &_swapchain);
+    VK_CHECK(vkCreateSwapchainKHR(_device, &sc_ci, nullptr, &_swapchain));
 
     uint32_t img_count = 0;
     vkGetSwapchainImagesKHR(_device, _swapchain, &img_count, nullptr);
@@ -323,7 +339,7 @@ void Engine::init_swapchain()
             .format   = _swapchain_format,
             .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 },
         };
-        vkCreateImageView(_device, &view_ci, nullptr, &_swapchain_views[i]);
+        VK_CHECK(vkCreateImageView(_device, &view_ci, nullptr, &_swapchain_views[i]));
     }
 
     // Semaphores are tied to swapchain image count — create them here so they
@@ -333,8 +349,8 @@ void Engine::init_swapchain()
     _present_semaphores.resize(img_count);
     for (uint32_t i = 0; i < img_count; ++i)
     {
-        vkCreateSemaphore(_device, &sem_ci, nullptr, &_acquire_semaphores[i]);
-        vkCreateSemaphore(_device, &sem_ci, nullptr, &_present_semaphores[i]);
+        VK_CHECK(vkCreateSemaphore(_device, &sem_ci, nullptr, &_acquire_semaphores[i]));
+        VK_CHECK(vkCreateSemaphore(_device, &sem_ci, nullptr, &_present_semaphores[i]));
     }
 }
 
@@ -354,9 +370,9 @@ void Engine::init_commands()
 
     for (auto& frame : _frames)
     {
-        vkCreateCommandPool(_device, &pool_ci, nullptr, &frame.cmd_pool);
+        VK_CHECK(vkCreateCommandPool(_device, &pool_ci, nullptr, &frame.cmd_pool));
         alloc_ci.commandPool = frame.cmd_pool;
-        vkAllocateCommandBuffers(_device, &alloc_ci, &frame.cmd);
+        VK_CHECK(vkAllocateCommandBuffers(_device, &alloc_ci, &frame.cmd));
         _deletions.push([this, &frame] {
             vkDestroyCommandPool(_device, frame.cmd_pool, nullptr);
         });
@@ -373,7 +389,7 @@ void Engine::init_sync()
     };
     for (auto& frame : _frames)
     {
-        vkCreateFence(_device, &fence_ci, nullptr, &frame.fence);
+        VK_CHECK(vkCreateFence(_device, &fence_ci, nullptr, &frame.fence));
         VkFence f = frame.fence;  // capture value, not reference, to avoid aliasing on recreate
         _deletions.push([this, f] { vkDestroyFence(_device, f, nullptr); });
     }
@@ -440,7 +456,7 @@ void Engine::init_descriptor_buffer()
         .flags        = VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT,
         .bindingCount = 0,
     };
-    vkCreateDescriptorSetLayout(_device, &layout_ci, nullptr, &_empty_set_layout);
+    VK_CHECK(vkCreateDescriptorSetLayout(_device, &layout_ci, nullptr, &_empty_set_layout));
     _deletions.push([&] {
         vkDestroyDescriptorSetLayout(_device, _empty_set_layout, nullptr);
     });
@@ -451,7 +467,7 @@ void Engine::init_descriptor_buffer()
         .setLayoutCount = 1,
         .pSetLayouts    = &_empty_set_layout,
     };
-    vkCreatePipelineLayout(_device, &pl_ci, nullptr, &_pipeline_layout);
+    VK_CHECK(vkCreatePipelineLayout(_device, &pl_ci, nullptr, &_pipeline_layout));
     _deletions.push([&] {
         vkDestroyPipelineLayout(_device, _pipeline_layout, nullptr);
     });
@@ -473,10 +489,10 @@ void Engine::init_descriptor_buffer()
                | VMA_ALLOCATION_CREATE_MAPPED_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO,
     };
-    vmaCreateBuffer(_allocator, &buf_ci, &vma_ci,
+    VK_CHECK(vmaCreateBuffer(_allocator, &buf_ci, &vma_ci,
         &_descriptor_buffer.buffer,
         &_descriptor_buffer.allocation,
-        &_descriptor_buffer.info);
+        &_descriptor_buffer.info));
     _deletions.push([&] {
         vmaDestroyBuffer(_allocator, _descriptor_buffer.buffer, _descriptor_buffer.allocation);
     });
@@ -518,7 +534,7 @@ void Engine::init_shaders()
     };
 
     VkShaderEXT shaders[2];
-    vkCreateShadersEXT(_device, 2, shader_infos, nullptr, shaders);
+    VK_CHECK(vkCreateShadersEXT(_device, 2, shader_infos, nullptr, shaders));
     _vert_shader = shaders[0];
     _frag_shader = shaders[1];
     _deletions.push([&] {

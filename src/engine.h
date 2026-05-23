@@ -42,8 +42,9 @@ private:
 
     VmaAllocator _allocator{};
 
-    // Both semaphore arrays are indexed by swapchain image index so the same
-    // semaphore is never signaled while the presentation engine still holds it.
+    // _acquire_semaphores: indexed by frame number — prevents reuse before the GPU finishes.
+    // _present_semaphores: indexed by swapchain image index — prevents reuse before
+    //                      the presentation engine releases that image.
     std::vector<VkSemaphore> _acquire_semaphores;
     std::vector<VkSemaphore> _present_semaphores;
 
