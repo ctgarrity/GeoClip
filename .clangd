@@ -1,0 +1,19 @@
+CompileFlags:
+  CompilationDatabase: build/debug
+
+Diagnostics:
+  UnusedIncludes: Strict
+
+InlayHints:
+  Enabled: true
+  ParameterNames: true
+  DeducedTypes: true
+
+Index:
+  Background: Build
+
+---
+If:
+  PathMatch: third_party/.*
+Diagnostics:
+  Suppress: '*'
