@@ -67,6 +67,20 @@ function(add_slang_shader TARGET SHADER_NAME)
     target_sources(${TARGET} PRIVATE ${vert_spv} ${frag_spv})
 endfunction()
 
+function(add_slang_compute_shader TARGET SHADER_NAME)
+    set(src      "${CMAKE_SOURCE_DIR}/shaders/${SHADER_NAME}.slang")
+    set(comp_spv "${CMAKE_BINARY_DIR}/shaders/${SHADER_NAME}.comp.spv")
+    set(slang_flags -target spirv -profile spirv_1_4 -emit-spirv-directly)
+    add_custom_command(
+        OUTPUT  ${comp_spv}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/shaders"
+        COMMAND ${SLANGC} ${src} -entry computeMain -stage compute ${slang_flags} -o ${comp_spv}
+        DEPENDS ${src}
+        VERBATIM
+    )
+    target_sources(${TARGET} PRIVATE ${comp_spv})
+endfunction()
+
 add_executable(GeoClip src/main.cpp src/engine.cpp src/vma_impl.cpp)
 target_link_libraries(GeoClip PRIVATE
     SDL3::SDL3
@@ -79,3 +93,4 @@ target_link_libraries(GeoClip PRIVATE
 target_include_directories(GeoClip PRIVATE src)
 
 add_slang_shader(GeoClip triangle)
+add_slang_compute_shader(GeoClip rotate)

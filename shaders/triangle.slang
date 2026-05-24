@@ -1,9 +1,12 @@
+struct ModelBuf { float4x4 model; };
+
 [[vk::push_constant]]
 cbuffer PushConstants
 {
-    float4x4 mvp;
-    float4x4 model;
-    float3   cam_pos;
+    float4x4 proj_view;   // offset  0, 64 bytes
+    float3   cam_pos;     // offset 64, 12 bytes
+    float    _pad;        // offset 76,  4 bytes
+    uint64_t model_bda;   // offset 80,  8 bytes
 };
 
 static const float3 kLightDir   = normalize(float3(1.0, 2.0, 1.5));
@@ -30,11 +33,12 @@ struct VertexOutput
 VertexOutput vertexMain(VertexInput input)
 {
     VertexOutput o;
-    float4 wp     = mul(model, float4(input.position, 1.0));
-    o.worldPos    = wp.xyz;
-    o.position    = mul(mvp, float4(input.position, 1.0));
-    o.worldNormal = normalize(mul((float3x3)model, input.normal));
-    o.uv          = input.uv;
+    float4x4 model = ((ModelBuf*)model_bda)->model;
+    float4   wp    = mul(model, float4(input.position, 1.0));
+    o.worldPos     = wp.xyz;
+    o.position     = mul(proj_view, wp);
+    o.worldNormal  = normalize(mul((float3x3)model, input.normal));
+    o.uv           = input.uv;
     return o;
 }
 

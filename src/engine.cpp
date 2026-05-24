@@ -120,6 +120,7 @@ void Engine::run()
 
         if (_swapchain_dirty)
             recreate_swapchain();
+        _rotation_angle += dt;
         draw();
     }
     vkDeviceWaitIdle(_device);
@@ -241,7 +242,7 @@ void Engine::init_vulkan()
     {
         VkPhysicalDeviceProperties props;
         vkGetPhysicalDeviceProperties(_physical_device, &props);
-        if (props.limits.maxPushConstantsSize < 144)
+        if (props.limits.maxPushConstantsSize < 88)
             throw std::runtime_error("GPU push constant limit too small");
     }
 
@@ -297,8 +298,9 @@ void Engine::init_vulkan()
         .descriptorBuffer = VK_TRUE,
     };
     VkPhysicalDeviceFeatures2 features2{
-        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-        .pNext = &desc_buf_features,
+        .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext    = &desc_buf_features,
+        .features = { .shaderInt64 = VK_TRUE },
     };
 
     VkDeviceCreateInfo dev_ci{
@@ -643,7 +645,7 @@ void Engine::init_descriptor_buffer()
     VkPushConstantRange push_range{
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset     = 0,
-        .size       = sizeof(glm::mat4) * 2 + sizeof(glm::vec4),
+        .size       = 88u,
     };
     VkPipelineLayoutCreateInfo pl_ci{
         .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -694,7 +696,7 @@ void Engine::init_shaders()
     VkPushConstantRange push_range{
         .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
         .offset     = 0,
-        .size       = sizeof(glm::mat4) * 2 + sizeof(glm::vec4),
+        .size       = 88u,
     };
     VkShaderCreateInfoEXT shader_infos[2] = {
         {
@@ -735,6 +737,55 @@ void Engine::init_shaders()
         vkDestroyShaderEXT(_device, _vert_shader, nullptr);
         vkDestroyShaderEXT(_device, _frag_shader, nullptr);
     });
+
+    // Compute pipeline layout
+    VkPushConstantRange compute_push_range{
+        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+        .offset     = 0,
+        .size       = 16u,  // sizeof({uint64_t, float}) with C++ trailing padding
+    };
+    VkPipelineLayoutCreateInfo compute_pl_ci{
+        .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &compute_push_range,
+    };
+    VK_CHECK(vkCreatePipelineLayout(_device, &compute_pl_ci, nullptr, &_compute_layout));
+    _deletions.push([&] { vkDestroyPipelineLayout(_device, _compute_layout, nullptr); });
+
+    // Compute shader object
+    auto comp_spirv = read_spirv(base / "shaders/rotate.comp.spv");
+    VkShaderCreateInfoEXT comp_info{
+        .sType                  = VK_STRUCTURE_TYPE_SHADER_CREATE_INFO_EXT,
+        .flags                  = 0,
+        .stage                  = VK_SHADER_STAGE_COMPUTE_BIT,
+        .nextStage              = 0,
+        .codeType               = VK_SHADER_CODE_TYPE_SPIRV_EXT,
+        .codeSize               = comp_spirv.size() * sizeof(uint32_t),
+        .pCode                  = comp_spirv.data(),
+        .pName                  = "main",
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges    = &compute_push_range,
+    };
+    VK_CHECK(vkCreateShadersEXT(_device, 1, &comp_info, nullptr, &_compute_shader));
+    _deletions.push([&] { vkDestroyShaderEXT(_device, _compute_shader, nullptr); });
+
+    // Rotation buffer — device-local, 64 bytes (one mat4)
+    VkBufferCreateInfo rot_buf_ci{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size  = sizeof(float) * 16,
+        .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+    };
+    VmaAllocationCreateInfo rot_vma_ci{ .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE };
+    VK_CHECK(vmaCreateBuffer(_allocator, &rot_buf_ci, &rot_vma_ci,
+        &_rotation_buf.buffer, &_rotation_buf.allocation, &_rotation_buf.info));
+    _deletions.push([&] {
+        vmaDestroyBuffer(_allocator, _rotation_buf.buffer, _rotation_buf.allocation);
+    });
+    VkBufferDeviceAddressInfo rot_addr_info{
+        .sType  = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+        .buffer = _rotation_buf.buffer,
+    };
+    _rotation_buf_bda = vkGetBufferDeviceAddress(_device, &rot_addr_info);
 }
 
 // ─── draw ───────────────────────────────────────────────────────────────────
@@ -773,6 +824,35 @@ void Engine::draw()
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     vkBeginCommandBuffer(frame.cmd, &begin);
+
+    // Compute pass: write animated rotation matrix to GPU buffer
+    {
+        VkShaderStageFlagBits comp_stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        vkCmdBindShadersEXT(frame.cmd, 1, &comp_stage, &_compute_shader);
+
+        struct ComputePC { uint64_t dst_bda; float angle; };
+        ComputePC cpc{ _rotation_buf_bda, _rotation_angle };
+        vkCmdPushConstants(frame.cmd, _compute_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, sizeof(ComputePC), &cpc);
+        vkCmdDispatch(frame.cmd, 1, 1, 1);
+
+        VkMemoryBarrier2 rot_barrier{
+            .sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            .srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+            .dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        };
+        VkDependencyInfo rot_dep{
+            .sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers    = &rot_barrier,
+        };
+        vkCmdPipelineBarrier2(frame.cmd, &rot_dep);
+
+        VkShaderEXT null_shader = VK_NULL_HANDLE;
+        vkCmdBindShadersEXT(frame.cmd, 1, &comp_stage, &null_shader);
+    }
 
     // Transition colour + depth images to their attachment layouts
     VkImageMemoryBarrier2 barriers[2] = {
@@ -908,7 +988,6 @@ void Engine::draw()
     };
     vkCmdSetVertexInputEXT(frame.cmd, 1, &vib, 3, via);
 
-    glm::mat4 model = glm::rotate(glm::mat4(1.f), glm::radians(90.f), glm::vec3(1, 0, 0));
     float yr = glm::radians(_yaw), pr = glm::radians(_pitch);
     glm::vec3 forward = glm::normalize(glm::vec3{
         std::cos(pr) * std::cos(yr),
@@ -919,11 +998,20 @@ void Engine::draw()
     glm::mat4 proj = glm::perspective(glm::radians(60.f),
         (float)_swapchain_extent.width / _swapchain_extent.height, 0.01f, 100.f);
     proj[1][1] *= -1;
-    struct PC { glm::mat4 mvp; glm::mat4 model; glm::vec4 cam_pos; };
-    PC pc{ proj * view * model, model, glm::vec4(_cam_pos, 1.f) };
+
+    struct GraphicsPC {
+        glm::mat4 proj_view;
+        glm::vec3 cam_pos;
+        float     _pad;
+        uint64_t  model_bda;
+    };
+    static_assert(sizeof(GraphicsPC) == 88);
+    static_assert(offsetof(GraphicsPC, model_bda) == 80);
+
+    GraphicsPC gpc{ proj * view, _cam_pos, 0.f, _rotation_buf_bda };
     vkCmdPushConstants(frame.cmd, _pipeline_layout,
         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0, sizeof(PC), &pc);
+        0, sizeof(GraphicsPC), &gpc);
 
     VkDeviceSize vertex_offset = 0;
     vkCmdBindVertexBuffers(frame.cmd, 0, 1, &_mesh.vertex_buffer.buffer, &vertex_offset);

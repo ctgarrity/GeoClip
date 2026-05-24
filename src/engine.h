@@ -64,6 +64,13 @@ private:
     VkPipelineLayout      _pipeline_layout{};
     AllocatedBuffer       _descriptor_buffer{};
 
+    VkShaderEXT      _compute_shader{};
+    VkPipelineLayout _compute_layout{};
+    AllocatedBuffer  _rotation_buf{};
+    VkDeviceAddress  _rotation_buf_bda{0};
+    float            _rotation_angle{0.f};
+    float            _dt{0.f};
+
     DeletionQueue _deletions;
 
     void init_vulkan();
